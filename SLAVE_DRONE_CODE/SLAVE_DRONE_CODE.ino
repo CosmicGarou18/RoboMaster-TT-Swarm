@@ -27,8 +27,8 @@ void setup() {
   } else {
     Serial.println("ESP-NOW: FAILED");
   }
+  interrupts();
 }
 
 void loop() {
-  delay(10);
 }
