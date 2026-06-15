@@ -3,12 +3,11 @@
 #include <Wire.h>
 #include <RMTT_Protocol.h>
 #include <RMTT_TOF.h>
-#include "esp_wifi.h"
 
 const unsigned long ROAM_MS     = 25000;
 const unsigned long WARNING_MS  =  5000;
 const unsigned long DECISION_MS =   150;
-const int CLEAR_CM = 100;
+const int CLEAR_CM = 80;
 
 bool airborne       = false;
 bool warningShown   = false;
@@ -31,6 +30,8 @@ void diag(const String& msg) {
 }
 
 void sendDroneCmd(const char* cmd) {
+  // Drain Serial1 buffer before sending — critical to prevent buffer overflow
+  while (Serial1.available()) Serial1.read();
   Serial1.printf("[TELLO] %s", cmd);
   diag(String("CMD: ") + cmd);
 }
@@ -49,14 +50,11 @@ void setup() {
   Serial1.begin(1000000, SERIAL_8N1, 23, 18);
   sdk.startUntilControl();
 
-  // Force WiFi to station mode and lock to channel 1
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
+  // ESP-NOW after handshake
   esp_now_init();
   esp_now_peer_info_t peer;
   memcpy(peer.peer_addr, BROADCAST, 6);
-  peer.channel = 1;
+  peer.channel = 0;
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
@@ -71,6 +69,9 @@ void setup() {
 }
 
 void loop() {
+  // CRITICAL — drain Serial1 buffer every loop to prevent overflow
+  while (Serial1.available()) Serial1.read();
+
   if (!airborne) return;
 
   unsigned long elapsed = millis() - missionStart;
