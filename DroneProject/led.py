@@ -1,8 +1,13 @@
 from djitellopy import Tello
 import time
 
-tello = Tello('192.168.10.1')
+tello = Tello()
 tello.connect()
-print(f"Battery: {tello.get_battery()}%")
+
+tello.takeoff()
+
+tello.send_rc_control(40, 0, 0, 0)
+time.sleep(2000)
+tello.land()
 
 tello.end()
