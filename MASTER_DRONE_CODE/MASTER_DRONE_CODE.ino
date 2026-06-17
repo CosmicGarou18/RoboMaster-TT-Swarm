@@ -1,9 +1,12 @@
 #include <WiFi.h>
-#include <esp_now.h>
 #include <Wire.h>
+
+#include <esp_now.h>
+
 #include <RMTT_Protocol.h>
 #include <RMTT_TOF.h>
 #include <RMTT_Libs.h>
+#include <RMTT_RGB.h>
 
 const unsigned long ROAM_MS     = 60000; // 1 minute
 const unsigned long WARNING_MS  =  5000;
@@ -17,6 +20,12 @@ unsigned long lastDecision = 0;
 bool isTurning      = false;
 String lastCmd      = "";
 
+volatile enum {
+  NONE_DETECTED,
+  LEFT_DETECTED,
+  RIGHT_DETECTED,
+} detectionState = NONE_DETECTED;
+
 bool matrixFlashOn      = false;
 unsigned long lastFlash = 0;
 const unsigned long FLASH_MS = 300;
@@ -24,6 +33,7 @@ const unsigned long FLASH_MS = 300;
 RMTT_TOF      tof;
 RMTT_Protocol sdk;
 RMTT_Matrix   tt_matrix;
+RMTT_RGB      LED;
 
 uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -97,6 +107,34 @@ void sendDroneCmd(const char* cmd, bool silent = false) {
   }
 }
 
+uint8_t msgBuffer[256];
+
+void packetHandler(const uint8_t *_, const uint8_t *data, int len) {
+  memcpy(msgBuffer, data, len);
+  msgBuffer[len] = '\0';
+  String msg = String((char*)msgBuffer);
+  if (!msg.equals("here")) {
+    return;
+  }
+
+  switch (detectionState) {
+  case NONE_DETECTED:
+    Serial.println("LEFT DETECTED");
+    esp_now_send(BROADCAST, (const uint8_t*)"l", 1);
+    detectionState = LEFT_DETECTED;
+    break;
+  
+  case LEFT_DETECTED:
+    Serial.println("RIGHT DETECTED");
+    esp_now_send(BROADCAST, (const uint8_t*)"r", 1);
+    detectionState = RIGHT_DETECTED;
+    break;
+  
+  case RIGHT_DETECTED:
+    return;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -109,6 +147,8 @@ void setup() {
   tt_matrix.SetLEDStatus(RMTT_MATRIX_CS, RMTT_MATRIX_SW, RMTT_MATRIX_LED_ON);
   tt_matrix.SetAllPWM((uint8_t*)matrix_off);
 
+  LED.Init();
+
   tof.Init();
   tof.SetMeasurementTimingBudget(30000);
   tof.StartContinuous();
@@ -117,6 +157,8 @@ void setup() {
 
   Serial1.begin(1000000, SERIAL_8N1, 23, 18);
   sdk.startUntilControl();
+  
+  LED.SetRGB(36, 153, 12);
 
   WiFi.mode(WIFI_STA);
   esp_now_init();
@@ -126,9 +168,16 @@ void setup() {
   peer.encrypt = false;
   esp_now_add_peer(&peer);
   diag("ESP-NOW ready");
-  sendDroneCmd("battery?")
-  sendDroneCmd("takeoff");
   delay(6000);
+
+  // First detect the left drone, then detect the right drone.
+
+  esp_now_register_recv_cb(packetHandler);
+  // Detect the left drone first
+
+
+  Serial.println("Waiting for the left drone...");
+  while (detectionState != LEFT_DETECTED) {}
 
   missionStart = millis();
   airborne     = true;
@@ -136,71 +185,78 @@ void setup() {
 }
 
 void loop() {
-  while (Serial1.available()) Serial1.read();
+  delay(1000);
+  
+  unsigned long delta = 
 
-  if (!airborne) return;
+  sendDroneCommand("takeoff");
+  Serial.println("bruh");
 
-  unsigned long elapsed = millis() - missionStart;
+  // while (Serial1.available()) Serial1.read();
 
-  // A. TIME EXPIRED → LAND
-  if (elapsed >= ROAM_MS + WARNING_MS) {
-    diag("TIME EXPIRED - landing");
-    sendDroneCmd("rc 0 0 0 0");
-    delay(300);
-    tt_matrix.SetAllPWM((uint8_t*)matrix_off);
-    sendDroneCmd("land");
-    airborne = false;
-    return;
-  }
+  // if (!airborne) return;
 
-  // B. WARNING PHASE — flash red matrix
-  if (elapsed >= ROAM_MS) {
-    if (!warningShown) {
-      warningShown = true;
-      diag("WARNING: 5s to land");
-      sendDroneCmd("rc 0 0 0 0");
-    }
-    if (millis() - lastFlash >= FLASH_MS) {
-      lastFlash = millis();
-      matrixFlashOn = !matrixFlashOn;
-      tt_matrix.SetAllPWM(matrixFlashOn ? (uint8_t*)matrix_red : (uint8_t*)matrix_off);
-    }
-    return;
-  }
+  // unsigned long elapsed = millis() - missionStart;
 
-  // C. ROAM PHASE
-  if (!warningShown && !isTurning && (millis() - lastDecision >= DECISION_MS)) {
-    lastDecision = millis();
+  // // A. TIME EXPIRED → LAND
+  // if (elapsed >= ROAM_MS + WARNING_MS) {
+  //   diag("TIME EXPIRED - landing");
+  //   sendDroneCmd("rc 0 0 0 0");
+  //   delay(300);
+  //   tt_matrix.SetAllPWM((uint8_t*)matrix_off);
+  //   sendDroneCmd("land");
+  //   airborne = false;
+  //   return;
+  // }
 
-    int mm = tof.ReadRangeContinuousMillimeters();
-    int cm = mm / 10;
+  // // B. WARNING PHASE — flash red matrix
+  // if (elapsed >= ROAM_MS) {
+  //   if (!warningShown) {
+  //     warningShown = true;
+  //     diag("WARNING: 5s to land");
+  //     sendDroneCmd("rc 0 0 0 0");
+  //   }
+  //   if (millis() - lastFlash >= FLASH_MS) {
+  //     lastFlash = millis();
+  //     matrixFlashOn = !matrixFlashOn;
+  //     tt_matrix.SetAllPWM(matrixFlashOn ? (uint8_t*)matrix_red : (uint8_t*)matrix_off);
+  //   }
+  //   return;
+  // }
 
-    if (cm == 0 || cm > CLEAR_CM) {
-      sendDroneCmd("rc 0 40 0 0");
-      if (lastCmd != "rc 0 40 0 0") {
-        diag("FORWARD");
-        tt_matrix.SetAllPWM((uint8_t*)matrix_up);
-      }
-    } else {
-      diag("BLOCKED " + String(cm) + "cm - TURNING");
-      isTurning = true;
+  // // C. ROAM PHASE
+  // if (!warningShown && !isTurning && (millis() - lastDecision >= DECISION_MS)) {
+  //   lastDecision = millis();
 
-      // Brake
-      tt_matrix.SetAllPWM((uint8_t*)matrix_down);
-      sendDroneCmd("rc 0 -70 0 0");
-      delay(750);
+  //   int mm = tof.ReadRangeContinuousMillimeters();
+  //   int cm = mm / 10;
 
-      // Stabilise
-      sendDroneCmd("rc 0 0 0 0");
-      delay(750);
+  //   if (cm == 0 || cm > CLEAR_CM) {
+  //     sendDroneCmd("rc 0 40 0 0");
+  //     if (lastCmd != "rc 0 40 0 0") {
+  //       diag("FORWARD");
+  //       tt_matrix.SetAllPWM((uint8_t*)matrix_up);
+  //     }
+  //   } else {
+  //     diag("BLOCKED " + String(cm) + "cm - TURNING");
+  //     isTurning = true;
 
-      // Turn
-      tt_matrix.SetAllPWM((uint8_t*)matrix_right);
-      sendDroneCmd("cw 90");
-      delay(2000);
+  //     // Brake
+  //     tt_matrix.SetAllPWM((uint8_t*)matrix_down);
+  //     sendDroneCmd("rc 0 -70 0 0");
+  //     delay(750);
 
-      isTurning = false;
-      diag("Turn complete");
-    }
-  }
+  //     // Stabilise
+  //     sendDroneCmd("rc 0 0 0 0");
+  //     delay(750);
+
+  //     // Turn
+  //     tt_matrix.SetAllPWM((uint8_t*)matrix_right);
+  //     sendDroneCmd("cw 90");
+  //     delay(2000);
+
+  //     isTurning = false;
+  //     diag("Turn complete");
+  //   }
+  // }
 }
