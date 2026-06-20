@@ -1,289 +1,63 @@
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
-
 #include <esp_now.h>
-
 #include <RMTT_Protocol.h>
 #include <RMTT_TOF.h>
 #include <RMTT_Libs.h>
 #include <RMTT_RGB.h>
 
-const unsigned long ROAM_MS     = 60000; // 1 minute
-const unsigned long WARNING_MS  =  5000;
-const unsigned long DECISION_MS =   150;
-const int CLEAR_CM = 100; // increased from 80
-
-bool airborne       = false;
-bool warningShown   = false;
-unsigned long missionStart = 0;
-unsigned long lastDecision = 0;
-bool isTurning      = false;
-String lastCmd      = "";
-
-volatile enum {
-  NONE_DETECTED,
-  LEFT_DETECTED,
-  RIGHT_DETECTED,
-} detectionState = NONE_DETECTED;
-
-bool inDanger = false;
-
-bool matrixFlashOn      = false;
-unsigned long lastFlash = 0;
-const unsigned long FLASH_MS = 300;
-
-RMTT_TOF      tof;
+// --- Hardware Objects ---
 RMTT_Protocol sdk;
-RMTT_Matrix   tt_matrix;
-RMTT_RGB      LED;
+WiFiUDP stateUDP;   // To capture the bridged telemetry stream
+const int STATE_PORT = 8890;
 
-uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-// ── MATRIX PATTERNS ─────────────────────────────────
-// Buffer is 128 bytes, 16x8 grid, each pixel = [red, blue]
-
-uint8_t matrix_off[128];
-uint8_t matrix_red[128];
-
-// Arrow pointing UP (forward)
-uint8_t matrix_up[128] = {
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 255,0, 255,0, 255,0, 0,0, 0,0,
-  0,0, 0,0, 255,0, 0,0, 255,0, 0,0, 255,0, 0,0,
-  0,0, 255,0, 0,0, 0,0, 255,0, 0,0, 0,0, 255,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,
-};
-
-// Arrow pointing RIGHT (turning CW)
-uint8_t matrix_right[128] = {
-  0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0,
-  255,0, 255,0, 255,0, 255,0, 255,0, 255,0, 255,0, 0,0,
-  255,0, 255,0, 255,0, 255,0, 255,0, 255,0, 255,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,
-};
-
-// Arrow pointing DOWN (braking/reversing)
-uint8_t matrix_down[128] = {
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 255,0, 0,0, 0,0, 255,0, 0,0, 0,0, 255,0,
-  0,0, 0,0, 255,0, 0,0, 255,0, 0,0, 255,0, 0,0,
-  0,0, 0,0, 0,0, 255,0, 255,0, 255,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 255,0, 0,0, 0,0, 0,0,
-  0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,
-};
-
-void buildMatrices() {
-  for (int i = 0; i < 128; i += 2) {
-    matrix_red[i]     = 255;
-    matrix_red[i + 1] = 0;
-    matrix_off[i]     = 0;
-    matrix_off[i + 1] = 0;
-  }
-}
-
-void diag(const char* msg) {
-  if (inDanger) {
-    return;
-  }
-
-  Serial.println(msg);
-  esp_now_send(BROADCAST, (uint8_t*)msg, strlen(msg));
-}
-
-void diag(const String& msg) {
-  diag(msg.c_str());
-}
-
-void sendDroneCmd(const char* cmd, bool silent = true) {
-  if (inDanger) {
-    return;
-  }
-
-  while (Serial1.available()) Serial1.read();
-
-  Serial1.printf("[TELLO] %s", cmd);
-  String cmdStr = String(cmd);
-
-  if (!silent && cmdStr != lastCmd) {
-    diag(String("CMD: ") + cmd);
-    lastCmd = cmdStr;
-  }
-}
-
-uint8_t msgBuffer[256];
-
-void packetHandler(const uint8_t *_, const uint8_t *data, int len) {
-  memcpy(msgBuffer, data, len);
-  msgBuffer[len] = '\0';
-  String msg = String((char*)msgBuffer);
-  if (!msg.equals("here")) {
-    return;
-  }
-
-  switch (detectionState) {
-  case NONE_DETECTED:
-    Serial.println("LEFT DETECTED");
-    esp_now_send(BROADCAST, (const uint8_t*)"l", 1);
-    detectionState = LEFT_DETECTED;
-    break;
-  
-  case LEFT_DETECTED:
-    Serial.println("RIGHT DETECTED");
-    esp_now_send(BROADCAST, (const uint8_t*)"r", 1);
-    detectionState = RIGHT_DETECTED;
-    break;
-  
-  case RIGHT_DETECTED:
-    return;
-  }
-}
-
-void dangerHandler(const uint8_t* mac, const uint8_t* data, int len) {
-  if (len <= 0 || len > 250) return;
-  
-  memcpy(msgBuffer, data, len);
-  msgBuffer[len] = '\0';
-  String s = String((char*)msgBuffer);
-
-  if (!s.startsWith("danger")) {
-    return;
-  }
-
-  if (s.endsWith(":l")) {
-    sendDroneCmd("rc 70 0 0 0");
-    diag("rc 0 -70 0 0 :l");
-    diag("rc 0 70 0 0 :r");
-    delay(750);
-  }
-  else if (s.endsWith(":r")) {
-    sendDroneCmd("rc -70 0 0 0");
-    diag("rc 0 70 0 0 :l");
-    diag("rc 0 -70 0 0 :r");
-    delay(750);
-  }
-
-  sendDroneCmd("rc 0 0 0 0");
-  diag("rc 0 0 0 0 :l");
-  diag("rc 0 0 0 0 :r");
-  delay(750);
-
-  inDanger = true;
-}
+// --- ESP-NOW Peer ---
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("=== INITIALIZING HARDWARE BRIDGE ===");
 
-  buildMatrices();
+    // 1. Fire up the physical Serial link to the drone first
+    Serial1.begin(1000000, SERIAL_8N1, 23, 18);
+    sdk.startUntilControl(); 
 
-  Wire.begin(27, 26);
-  Wire.setClock(400000);
+    // 2. Configure the ESP32 as an Access Point instead of trying to search for the Tello wirelessly
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("RMTT_Swarm_Node", "12345678");
+    Serial.println("AP Mode Spawned locally.");
 
-  tt_matrix.Init(127);
-  tt_matrix.SetLEDStatus(RMTT_MATRIX_CS, RMTT_MATRIX_SW, RMTT_MATRIX_LED_ON);
-  tt_matrix.SetAllPWM((uint8_t*)matrix_off);
+    // 3. Initialize ESP-NOW 
+    if (esp_now_init() == ESP_OK) {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+    }
 
-  LED.Init();
-
-  tof.Init();
-  tof.SetMeasurementTimingBudget(30000);
-  tof.StartContinuous();
-
-  delay(5000);
-
-  Serial1.begin(1000000, SERIAL_8N1, 23, 18);
-  sdk.startUntilControl();
-  
-  LED.SetRGB(36, 153, 12);
-
-  WiFi.mode(WIFI_STA);
-  esp_now_init();
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, BROADCAST, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
-  diag("ESP-NOW ready");
-  delay(6000);
-
-  // First detect the left drone, then detect the right drone.
-
-  esp_now_register_recv_cb(packetHandler);
-  // Detect the left drone first
-
-  Serial.println("Waiting for the left drone...");
-  while (detectionState != LEFT_DETECTED) {}
-
-  missionStart = millis();
-  airborne     = true;
-  diag("Mission started");
+    // 4. Open the UDP port locally to catch the internal telemetry mirror
+    stateUDP.begin(STATE_PORT);
+    
+    // Tell the drone processor via Serial to start mirroring UDP telemetry packets to the expansion slot
+    Serial1.print("[TELLO] command");
+    delay(200);
+    Serial1.print("[TELLO] streamon");
+    delay(200);
 }
 
 void loop() {
-  while (Serial1.available()) Serial1.read();
-
-  if (inDanger) {
-    inDanger = false;
-    sendDroneCmd("land");
-    diag("land :r");
-    diag("land :l");
-    inDanger = true;
-    while (true) {}
-  }
-
-  if (!airborne) return;
-
-  unsigned long elapsed = millis() - missionStart;
-
-  // A. TIME EXPIRED → LAND
-  if (elapsed >= ROAM_MS + WARNING_MS) {
-    diag("TIME EXPIRED - landing");
-    sendDroneCmd("rc 0 0 0 0");
-    delay(300);
-    tt_matrix.SetAllPWM((uint8_t*)matrix_off);
-    sendDroneCmd("land");
-    airborne = false;
-    return;
-  }
-
-  // B. WARNING PHASE — flash red matrix
-  if (elapsed >= ROAM_MS) {
-    if (!warningShown) {
-      warningShown = true;
-      diag("WARNING: 5s to land");
-      sendDroneCmd("rc 0 0 0 0");
+    // Listen for UDP data packages hitting port 8890 over the hardware bridge
+    int packetSize = stateUDP.parsePacket();
+    if (packetSize > 0) {
+        char buffer[256];
+        stateUDP.read(buffer, packetSize);
+        buffer[packetSize] = '\0';
+        
+        // Transmit out to your other swarm modules instantly
+        esp_now_send(broadcastAddress, (uint8_t*)buffer, strlen(buffer));
+        Serial.printf("Bridged Telemetry Payload: %s\n", buffer);
     }
-    if (millis() - lastFlash >= FLASH_MS) {
-      lastFlash = millis();
-      matrixFlashOn = !matrixFlashOn;
-      tt_matrix.SetAllPWM(matrixFlashOn ? (uint8_t*)matrix_red : (uint8_t*)matrix_off);
-    }
-    return;
-  }
-
-  // C. ROAM PHASE
-  if (!warningShown && !isTurning && (millis() - lastDecision >= DECISION_MS)) {
-    lastDecision = millis();
-
-    int mm = tof.ReadRangeContinuousMillimeters();
-    int cm = mm / 10;
-
-    if (cm == 0 || cm > CLEAR_CM) {
-      sendDroneCmd("rc 0 40 0 0");
-      if (lastCmd != "rc 0 40 0 0") {
-        diag("FORWARD");
-        tt_matrix.SetAllPWM((uint8_t*)matrix_up);
-      }
-    } else {
-      inDanger = true;
-    }
-  }
 }

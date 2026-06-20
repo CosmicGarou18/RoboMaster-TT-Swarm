@@ -4,10 +4,10 @@ import time
 tello = Tello()
 tello.connect()
 
-tello.takeoff()
-
-tello.send_rc_control(40, 0, 0, 0)
-time.sleep(2000)
-tello.land()
+while True:
+    time.sleep(0.5)
+    print(f"agx: {tello.get_acceleration_x()} " +
+          f"agy: {tello.get_acceleration_y()} " +
+          f"agz: {tello.get_acceleration_z()}")
 
 tello.end()
