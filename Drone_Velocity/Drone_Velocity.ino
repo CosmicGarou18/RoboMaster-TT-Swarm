@@ -8,6 +8,76 @@
 
 const uint8_t BROADCAST[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
+// ====================================================================
+// CLASS: PIDController (Pure Math Logic)
+// ====================================================================
+class PIDController {
+private:
+  float kp, ki, kd;
+  float integralLimit;
+  float integral;
+  float lastError;
+
+public:
+  PIDController(float p, float i, float d, float iLimit) 
+    : kp(p), ki(i), kd(d), integralLimit(iLimit), integral(0.0f), lastError(0.0f) {}
+
+  void reset() {
+    integral = 0.0f;
+    lastError = 0.0f;
+  }
+
+  float compute(float error, float dtSec) {
+    if (dtSec > 0) {
+      integral += error * dtSec;
+      integral = constrain(integral, -integralLimit, integralLimit);
+    }
+    float derivative = (dtSec > 0) ? (error - lastError) / dtSec : 0.0f;
+    lastError = error;
+    return (kp * error) + (ki * integral) + (kd * derivative);
+  }
+};
+
+// ====================================================================
+// CLASS: DroneController (Pure Movement/Target Tracking Layer)
+// ====================================================================
+class DroneController {
+private:
+  PIDController pid;
+  float targetDistMeters;
+  const float outScale = 65.0f; // Scale factor mapping meter error to RC
+  const int maxPitchCmd = 35;   // Hard limit clamp for trial safety
+
+public:
+  DroneController() : pid(8f, 0.05f, 0.25f, 4.0f), targetDistMeters(0.60f) {}
+
+  void setTargetDistanceMm(int targetMm) {
+    targetDistMeters = targetMm / 1000.0f;
+  }
+
+  void resetController() {
+    pid.reset();
+  }
+
+  int updateTracking(int currentDistMm, float dtSec) {
+    float currentDistMeters = currentDistMm / 1000.0f;
+    
+    // Error tracking: positive error means drone is too far back (must fly forward)
+    float error = currentDistMeters - targetDistMeters;
+    
+    float pidOutput = pid.compute(error, dtSec);
+    int rcPitchCmd = (int)(pidOutput * outScale);
+    rcPitchCmd = constrain(rcPitchCmd, -maxPitchCmd, maxPitchCmd);
+
+    // Issue the tracking movement directly to the flight hardware
+    char rcBuf[32];
+    snprintf(rcBuf, sizeof(rcBuf), "rc 0 %d 0 0", rcPitchCmd);
+    sendDroneCmd(rcBuf, true); 
+
+    return rcPitchCmd; // Returns the applied value for external logging/telemetry
+  }
+};
+
 void diag(const char* msg) {
   Serial.println(msg);
   esp_now_send(BROADCAST, (uint8_t*)msg, strlen(msg));
@@ -146,6 +216,11 @@ void setup() {
 
   LED.SetRGB(255, 165, 0);
   diag("READY — position drone facing wall, press button to start trial");
+}
+
+void hover() {
+  DroneController c;
+  c.setTargetDistanceMm(sdk.)
 }
 
 void loop() {
