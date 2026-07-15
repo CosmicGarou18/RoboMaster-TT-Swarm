@@ -1,407 +1,284 @@
 """
-RC -> velocity characterization script (forward-only).
+Velocity_Finder.py (forward_obstacle_stop, thread-safe version)
+Fly forward at fixed rc, z-axis held by PID via TOF, front-TOF (via EXT tof?)
+triggers brake+land. Prints time-of-flight.
 
-Flat sequence of (rc_value, trial_number) pairs, rc_value stepping by 10,
-TRIALS_PER_RC trials each. For each trial:
-
-  forward @ rc for MOVE_S sec, recording vgy
-  wait for operator input:
-    G = go        -> continue to the next trial (still airborne)
-    L = land      -> land now, wait for repositioning, wait for next G,
-                      takeoff, resume at the SAME next trial (nothing skipped)
-  E = emergency motor cut, works at any point, any state
-
-If landing happens mid-forward-segment (not just at the wait point), that
-segment is aborted and discarded/retried — never recorded as a partial trial.
-
-If the script itself lands due to battery <15% or z-axis PID saturation,
-that's treated as a real fault: the whole test stops, it does NOT wait for
-a G to resume.
-
-Deps: pip install djitellopy keyboard
+FIX: all djitellopy calls now serialized through a shared lock — djitellopy
+is NOT thread-safe, and the front-TOF polling thread was stepping on
+command/response pairs on the main control thread (e.g. 'takeoff' reading
+back a stray 'tof 8191' response). Every single call site that touches
+`tello` must go through safe_call().
 """
 
 import time
 import threading
-import statistics
-import csv
-import os
 from djitellopy import Tello
-from djitellopy.swarm import TelloSwarm
 
-# ---------------- Config ----------------
-RC_START, RC_END, RC_STEP = 10, 100, 10   # unconfirmed assumption, change if wrong
-TRIALS_PER_RC = 10
-MOVE_S = 4.0
-POST_TAKEOFF_SETTLE_S = 3.0
+# ---------------- CONFIG ----------------
+FORWARD_RC            = 30
+BRAKE_RC              = -100
+BRAKE_DURATION_S      = 0.3    # ASSUMPTION — tune this
+OBSTACLE_THRESHOLD_MM = 500    # ASSUMPTION — you never gave me a real number, change this
 
-Z_KP, Z_KI, Z_KD = 6.25, 0.333, 1.625
-TARGET_HEIGHT_CM = 100
+ORIGIN_ALTITUDE_CM = 100
+Z_KP, Z_KI, Z_KD   = 5.0, 0.333, 1.625
 
-CONTROL_HZ = 20
-DT = 1.0 / CONTROL_HZ
-Z_SATURATION_LIMIT = 40
-Z_SATURATION_ABORT_S = 5
-BATTERY_ABORT_PCT = 15
-HEARTBEAT_S = 5
+CONTROL_HZ         = 20
+SETTLE_S           = 3.0
+SATURATION_ABORT_S = 1.5
+BATTERY_ABORT_PCT  = 15
+HEARTBEAT_S        = 5.0
+FRONT_TOF_POLL_S   = 0.15
 
-OUTPUT_CSV = "output/rc_to_velocity.csv"
+OUTPUT_CSV = "output/forward_obstacle_flight_log.csv"
 
-_last_good_battery = 100
-_last_good_speed = {"x": 0.0, "y": 0.0 }
+# ---------------- GLOBAL LOCK — every djitellopy call goes through this ----------------
+tello_lock = threading.Lock()
 
-
-def safe_int_battery(tello):
-    global _last_good_battery
-    try:
-        v = int(tello.get_battery())
-        _last_good_battery = v
-        return v
-    except (ValueError, TypeError):
-        return _last_good_battery
+def safe_call(fn, *args, **kwargs):
+    """Serializes ALL access to the Tello command/response channel.
+    djitellopy has no internal locking — two threads calling it at once
+    WILL cross-wire responses (this is exactly what broke takeoff)."""
+    with tello_lock:
+        return fn(*args, **kwargs)
 
 
-def safe_speed(tello, axis):
-    global _last_good_speed
-    try:
-        v = float(tello.get_speed_x() if axis == "x" else tello.get_speed_y())
-        _last_good_speed[axis] = v
-        return v
-    except (ValueError, TypeError):
-        return _last_good_speed[axis]
-
-
-class HeightReader:
-    def __init__(self):
-        self.last_good = TARGET_HEIGHT_CM
-
-    def read(self, tello):
-        try:
-            d = tello.get_distance_tof()
-        except Exception:
-            return self.last_good
-        if d == 8888 or d <= 1 or d >= 800:
-            return self.last_good
-        if abs(d - self.last_good) > 50:
-            return self.last_good
-        self.last_good = d
-        return d
-
-
+# ---------------- PID CLASS ----------------
 class PID:
-    def __init__(self, kp, ki, kd):
+    def __init__(self, kp, ki, kd, output_limit=100):
         self.kp, self.ki, self.kd = kp, ki, kd
+        self.output_limit = output_limit
         self.integral = 0.0
         self.prev_error = 0.0
+        self.lock = threading.Lock()
 
     def reset(self):
-        self.integral = 0.0
-        self.prev_error = 0.0
+        with self.lock:
+            self.integral = 0.0
+            self.prev_error = 0.0
 
-    def step(self, error, dt):
-        self.integral += error * dt
-        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
-        self.prev_error = error
-        return self.kp * error + self.ki * self.integral + self.kd * derivative
+    def compute(self, error, dt):
+        with self.lock:
+            self.integral += error * dt
+            derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+            self.prev_error = error
+            output = self.kp * error + self.ki * self.integral + self.kd * derivative
+            return max(-self.output_limit, min(self.output_limit, output))
 
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+# ---------------- HEIGHT READER ----------------
+class HeightReader:
+    def __init__(self, tello):
+        self.tello = tello
+        self.last_good = ORIGIN_ALTITUDE_CM
+        self.lock = threading.Lock()
+
+    def read(self):
+        try:
+            raw = safe_call(self.tello.get_distance_tof)
+        except Exception:
+            return self.last_good
+        if raw == 8888 or raw < 1 or raw > 800:
+            return self.last_good
+        with self.lock:
+            if abs(raw - self.last_good) > 50:
+                return self.last_good
+            self.last_good = raw
+        return raw
 
 
-class ControlLoopThread(threading.Thread):
-    """z-hover PID runs continuously. fb externally settable via set_fb().
-    Recording externally toggled; while recording, vgy samples collected."""
+# ---------------- SAFE READS ----------------
+def safe_int_battery(tello, last_good=[100]):
+    try:
+        val = int(safe_call(tello.get_battery))
+        last_good[0] = val
+        return val
+    except Exception:
+        return last_good[0]
 
-    def __init__(self, tello: Tello):
+
+# ---------------- FRONT TOF THREAD ----------------
+class FrontTOFThread(threading.Thread):
+    def __init__(self, tello):
         super().__init__(daemon=True)
         self.tello = tello
-        self.running = True
-        self.land_flag = False
-        self.emergency_flag = False
-        self.abort_reason = ""   # "battery" / "z_saturation" / "" (manual/none)
-
-        self.height_reader = HeightReader()
-        self.pid_z = PID(Z_KP, Z_KI, Z_KD)
-
         self.lock = threading.Lock()
-        self.fb = 0
-        self.recording = False
-        self.samples = []
-
-        self.sat_timer_z = 0.0
-        self.last_heartbeat = time.time()
-        self.status = {"height": TARGET_HEIGHT_CM, "err_z": 0.0, "out_z": 0.0,
-                        "battery": 100, "flags": ""}
-
-    def set_fb(self, value):
-        with self.lock:
-            self.fb = value
-
-    def start_recording(self):
-        with self.lock:
-            self.samples = []
-            self.recording = True
-
-    def stop_recording(self):
-        with self.lock:
-            self.recording = False
-            return list(self.samples)
-
-    def run(self):
-        t: Tello = self.tello
-        self.pid_z.reset()
-
-        t0 = time.time()
-
-        while True:
-            loop_start = time.time()
-
-            dist = self.tello.send_read_command_int("EXT tof?")
-            if dist <= 100:
-                t.send_rc_control(0, -100, 0, 0)
-                time.sleep(0.5)
-                t.send_rc_control(0, 0, 0, 0)
-                time.sleep(0.3)
-                t.land()
-
-                dt = time.time() - t0
-                vel = 6.6 / dt
-
-                print(f"Time taken: {dt}")
-                print(f"Velocity = {vel}")
-
-                with open("output/out.csv", "+a") as f:
-                    print(f"{fb}, {vel}", file=f)
-
-                break
-
-            if self.emergency_flag:
-                t.emergency()
-                break
-            if self.land_flag:
-                t.send_rc_control(0, 0, 0, 0)
-                time.sleep(0.3)
-                t.land()
-                break
-
-            battery = safe_int_battery(t)
-            if battery < BATTERY_ABORT_PCT:
-                self.status["flags"] = "BATTERY ABORT"
-                self.abort_reason = "battery"
-                self.land_flag = True
-                continue
-
-            height = self.height_reader.read(t)
-            err_z = TARGET_HEIGHT_CM - height
-            out_z = clamp(self.pid_z.step(err_z, DT), -Z_SATURATION_LIMIT, Z_SATURATION_LIMIT)
-
-            if abs(out_z) >= Z_SATURATION_LIMIT:
-                self.sat_timer_z += DT
-            else:
-                self.sat_timer_z = 0.0
-
-            if self.sat_timer_z >= Z_SATURATION_ABORT_S:
-                self.status["flags"] = "Z SATURATION ABORT"
-                self.abort_reason = "z_saturation"
-                self.land_flag = True
-
-            with self.lock:
-                fb = self.fb
-                recording = self.recording
-
-            t.send_rc_control(0, fb, int(out_z), 0)
-
-            if recording:
-                vgy = safe_speed(t, "y")
-                with self.lock:
-                    self.samples.append(vgy)
-
-            if time.time() - self.last_heartbeat >= HEARTBEAT_S:
-                self.last_heartbeat = time.time()
-
-            self.status.update(height=height, err_z=err_z, out_z=out_z, battery=battery)
-
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.0, DT - elapsed))
-
-
-class OperatorInputThread(threading.Thread):
-    """Polls keyboard the whole session: E=emergency (any time), L=land
-    request (sets land_event), G=go (sets go_event). get_active_loop() is
-    a callable returning the current ControlLoopThread or None."""
-
-    def __init__(self, get_active_loop, land_event, go_event):
-        super().__init__(daemon=True)
-        self.get_active_loop = get_active_loop
-        self.land_event = land_event
-        self.go_event = go_event
+        self.distance_mm = None
         self.running = True
 
     def run(self):
-        import keyboard
         while self.running:
-            if keyboard.is_pressed('e'):
-                loop = self.get_active_loop()
-                if loop is not None:
-                    loop.emergency_flag = True
-                time.sleep(0.5)
+            try:
+                resp = safe_call(self.tello.send_command_with_return, "EXT tof?")
+                resp = resp.strip()
+                if "keepalive" in resp:
+                    time.sleep(FRONT_TOF_POLL_S)
+                    continue
+                if resp.startswith("tof"):
+                    val = int(resp.split()[1])
+                    if 0 <= val <= 8192:
+                        with self.lock:
+                            self.distance_mm = val
+            except Exception:
+                pass
+            time.sleep(FRONT_TOF_POLL_S)
+
+    def get_distance(self):
+        with self.lock:
+            return self.distance_mm
+
+    def stop(self):
+        self.running = False
+
+
+# ---------------- SAFETY KEYS ----------------
+class SafetyKeys(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.land_requested = False
+        self.emergency_requested = False
+        self.running = True
+
+    def run(self):
+        try:
+            import keyboard
+        except ImportError:
+            print("[WARN] 'keyboard' module not installed — manual L/E override disabled.")
+            return
+        while self.running:
             if keyboard.is_pressed('l'):
-                self.land_event.set()
-                time.sleep(0.3)
-            if keyboard.is_pressed('g'):
-                self.go_event.set()
-                time.sleep(0.3)
+                self.land_requested = True
+            if keyboard.is_pressed('e'):
+                self.emergency_requested = True
             time.sleep(0.05)
 
-
-def wait_for_go_or_land(land_event, go_event):
-    print("  Waiting for G (go) or L (land)...")
-    while True:
-        if land_event.is_set():
-            land_event.clear()
-            return 'land'
-        if go_event.is_set():
-            go_event.clear()
-            return 'go'
-        time.sleep(0.05)
+    def stop(self):
+        self.running = False
 
 
-def do_forward_segment(loop, rc, duration, land_event):
-    """Returns (samples, interrupted_bool)."""
-    loop.set_fb(rc)
-    loop.start_recording()
-    start = time.time()
-    interrupted = False
-    while time.time() - start < duration:
-        if land_event.is_set():
-            interrupted = True
-            break
-        if loop.land_flag:  # autonomous abort (battery/z-saturation)
-            interrupted = True
-            break
-        time.sleep(0.05)
-    samples = loop.stop_recording()
-    loop.set_fb(0)
-    return samples, interrupted
-
-
-def takeoff_and_start_loop(tello):
-    tello.takeoff()
-    time.sleep(POST_TAKEOFF_SETTLE_S)
-    loop = ControlLoopThread(tello)
-    loop.start()
-    return loop
-
-
-def land_and_stop_loop(loop):
-    loop.set_fb(0)
-    time.sleep(0.3)
-    loop.land_flag = True
-    time.sleep(3)
-    loop.running = False
-
-
+# ---------------- MAIN ----------------
 def main():
+    import os
+    os.makedirs("output", exist_ok=True)
+
     tello = Tello()
-    tello.connect()
-    battery = tello.get_battery()
-    print(f"Battery: {battery}%")
-    if battery < 30:
-        print("Battery too low to safely run this test. Aborting.")
+    safe_call(tello.connect)
+
+    bat = safe_int_battery(tello)
+    print(f"[INFO] Battery: {bat}%")
+    if bat < BATTERY_ABORT_PCT:
+        print("[ABORT] Battery too low to fly.")
         return
 
-    active_loop_holder = {"loop": None}
-    land_event = threading.Event()
-    go_event = threading.Event()
-    operator = OperatorInputThread(lambda: active_loop_holder["loop"], land_event, go_event)
-    operator.start()
+    height_reader = HeightReader(tello)
+    z_pid = PID(Z_KP, Z_KI, Z_KD, output_limit=60)
+    front_tof = FrontTOFThread(tello)
+    front_tof.start()
+    safety = SafetyKeys()
+    safety.start()
 
-    trials = [(rc, n) for rc in range(RC_START, RC_END + 1, RC_STEP)
-              for n in range(1, TRIALS_PER_RC + 1)]
+    obstacle_triggered = False
+    saturation_start = None
+    last_heartbeat = time.time()
+    t_start = None
+    t_end = None
+    z_output = 0
 
-    results = {}  # rc_value -> list of trial avg velocities
-    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    write_header = not os.path.exists(OUTPUT_CSV)
+    def send_rc(pitch):
+        safe_call(tello.send_rc_control, 0, pitch, int(z_output), 0)
 
-    loop = takeoff_and_start_loop(tello)
-    active_loop_holder["loop"] = loop
+    try:
+        safe_call(tello.takeoff)
+        t_start = time.time()
+        print(f"[INFO] Takeoff at t={t_start:.3f}")
 
-    i = 0
-    while i < len(trials):
-        rc, trial_num = trials[i]
-        print(f"\nRC={rc} trial {trial_num}/{TRIALS_PER_RC} (overall {i + 1}/{len(trials)})")
+        print(f"[INFO] Settling for {SETTLE_S}s before control starts...")
+        time.sleep(SETTLE_S)
 
-        samples, interrupted = do_forward_segment(loop, rc, MOVE_S, land_event)
+        z_pid.reset()
+        last_tick = time.time()
 
-        if interrupted:
-            if loop.abort_reason in ("battery", "z_saturation"):
-                print(f"Autonomous abort ({loop.abort_reason}) mid-trial. "
-                      f"Trial discarded. Stopping test entirely — not safe to resume.")
-                land_and_stop_loop(loop)
-                active_loop_holder["loop"] = None
+        while True:
+            now = time.time()
+            dt = now - last_tick
+            if dt <= 0:
+                dt = 1.0 / CONTROL_HZ
+            last_tick = now
+
+            if safety.emergency_requested:
+                print("[MANUAL] Emergency stop requested.")
+                safe_call(tello.emergency)
                 break
+            if safety.land_requested:
+                print("[MANUAL] Land requested.")
+                safe_call(tello.send_rc_control, 0, 0, 0, 0)
+                safe_call(tello.land)
+                t_end = time.time()
+                break
+
+            bat = safe_int_battery(tello)
+            if bat < BATTERY_ABORT_PCT:
+                print(f"[SAFETY] Battery {bat}% below threshold — landing.")
+                safe_call(tello.send_rc_control, 0, 0, 0, 0)
+                safe_call(tello.land)
+                t_end = time.time()
+                break
+
+            current_height = height_reader.read()
+            z_error = ORIGIN_ALTITUDE_CM - current_height
+            z_output = z_pid.compute(z_error, dt)
+
+            if abs(z_output) >= 59:
+                if saturation_start is None:
+                    saturation_start = now
+                elif now - saturation_start >= SATURATION_ABORT_S:
+                    print("[SAFETY] z-axis output pinned — landing.")
+                    safe_call(tello.send_rc_control, 0, 0, 0, 0)
+                    safe_call(tello.land)
+                    t_end = time.time()
+                    break
             else:
-                print("Landed mid-trial by request. Trial discarded, will retry after resume.")
-                land_and_stop_loop(loop)
-                active_loop_holder["loop"] = None
-                land_event.clear()
-                input("Reposition the drone to a safe start position, then press G to resume...")
-                go_event.clear()
-                while not go_event.is_set():
-                    time.sleep(0.05)
-                go_event.clear()
-                loop = takeoff_and_start_loop(tello)
-                active_loop_holder["loop"] = loop
-                continue  # retry same i, same trial
+                saturation_start = None
 
-        avg_v = statistics.mean(abs(v) for v in samples) if samples else 0.0
-        results.setdefault(rc, []).append(avg_v)
-        print(f"  avg |vgy| = {avg_v:.2f} cm/s ({len(samples)} samples) "
-              f"battery={loop.status['battery']}%")
+            front_dist = front_tof.get_distance()
+            if front_dist is not None and front_dist < OBSTACLE_THRESHOLD_MM:
+                print(f"[OBSTACLE] Front TOF={front_dist}mm < {OBSTACLE_THRESHOLD_MM}mm — braking.")
+                safe_call(tello.send_rc_control, 0, BRAKE_RC, 0, 0)
+                time.sleep(BRAKE_DURATION_S)
+                safe_call(tello.send_rc_control, 0, 0, 0, 0)
+                time.sleep(0.3)
+                safe_call(tello.land)
+                t_end = time.time()
+                obstacle_triggered = True
+                break
 
-        with open(OUTPUT_CSV, "a", newline="") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(["rc_value", "trial_number", "avg_velocity_cm_s"])
-                write_header = False
-            writer.writerow([rc, trial_num, f"{avg_v:.3f}"])
+            send_rc(FORWARD_RC)
 
-        if trial_num == TRIALS_PER_RC:
-            block_avg = statistics.mean(results[rc])
-            print(f"=== RC={rc} complete: avg over {len(results[rc])} trials "
-                  f"= {block_avg:.2f} cm/s ===")
+            if now - last_heartbeat >= HEARTBEAT_S:
+                safe_call(tello.get_battery)
+                last_heartbeat = now
 
-        i += 1
-        if i >= len(trials):
-            break  # done, land below, no need to wait
+            time.sleep(max(0, (1.0 / CONTROL_HZ) - (time.time() - now)))
 
-        action = wait_for_go_or_land(land_event, go_event)
-        if action == 'land':
-            print("Landing by request.")
-            land_and_stop_loop(loop)
-            active_loop_holder["loop"] = None
-            input("Reposition the drone to a safe start position, then press G to resume...")
-            go_event.clear()
-            while not go_event.is_set():
-                time.sleep(0.05)
-            go_event.clear()
-            loop = takeoff_and_start_loop(tello)
-            active_loop_holder["loop"] = loop
-        # if 'go': stays airborne, loop continues to next i
+    except KeyboardInterrupt:
+        print("[Ctrl+C] Landing (not motor-cut).")
+        try:
+            safe_call(tello.send_rc_control, 0, 0, 0, 0)
+            safe_call(tello.land)
+        except Exception:
+            pass
+        t_end = time.time()
 
-    if active_loop_holder["loop"] is not None:
-        land_and_stop_loop(active_loop_holder["loop"])
-        active_loop_holder["loop"] = None
-
-    operator.running = False
-
-    print("\n=== FINAL RESULTS ===")
-    for rc_value in sorted(results):
-        avg_v = statistics.mean(results[rc_value])
-        print(f"rc={rc_value:>3}  ->  avg |velocity| = {avg_v:.2f} cm/s "
-              f"({len(results[rc_value])} trials)")
-    print(f"\nWritten to {OUTPUT_CSV}")
+    finally:
+        front_tof.stop()
+        safety.stop()
+        if t_start is not None:
+            t_end = t_end or time.time()
+            tof_flight = t_end - t_start
+            print(f"[RESULT] Time of flight: {tof_flight:.2f}s "
+                  f"({'obstacle-triggered' if obstacle_triggered else 'other exit'})")
+            with open(OUTPUT_CSV, "a") as f:
+                f.write(f"{t_start},{t_end},{tof_flight:.3f},{obstacle_triggered}\n")
 
 
 if __name__ == "__main__":
