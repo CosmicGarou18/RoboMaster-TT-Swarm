@@ -216,11 +216,11 @@ void setup() {
 
   // First detect the left drone, then detect the right drone.
 
-  esp_now_register_recv_cb(packetHandler);
-  // Detect the left drone first
+  // esp_now_register_recv_cb(packetHandler);
+  // // Detect the left drone first
 
-  Serial.println("Waiting for the left drone...");
-  while (detectionState != LEFT_DETECTED) {}
+  // Serial.println("Waiting for the left drone...");
+  // while (detectionState != LEFT_DETECTED) {}
 
   missionStart = millis();
   airborne     = true;
